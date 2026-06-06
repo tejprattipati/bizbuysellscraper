@@ -7,13 +7,20 @@ import json
 import os
 import smtplib
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
+
+_scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
 
 # ---------------------------------------------------------------------------
 # Configuration — override any of these via environment variables
@@ -108,11 +115,11 @@ def save_seen(seen: set) -> None:
 def fetch_page(url: str, retries: int = 3) -> BeautifulSoup | None:
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp = _scraper.get(url, headers=HEADERS, timeout=30)
             if resp.status_code == 200:
                 return BeautifulSoup(resp.text, "html.parser")
             print(f"HTTP {resp.status_code} for {url}")
-        except requests.RequestException as e:
+        except Exception as e:
             print(f"Request error (attempt {attempt + 1}): {e}")
         time.sleep(2 ** attempt)
     return None
@@ -308,7 +315,7 @@ def build_email_html(new_listings: list[dict]) -> str:
     <html><body style="font-family:Arial,sans-serif;color:#333;max-width:900px;margin:auto;">
     <h2 style="color:#1a73e8;">BizBuySell — New Agriculture Listings</h2>
     <p>Found <strong>{len(new_listings)}</strong> new listing(s) matching your criteria
-    as of {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.</p>
+    as of {_now().strftime('%Y-%m-%d %H:%M UTC')}.</p>
 
     <p><strong>Active filters:</strong><br>
     Price: ${PRICE_MIN:,.0f} – ${PRICE_MAX:,.0f}<br>
@@ -359,7 +366,7 @@ def send_email(new_listings: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"=== BizBuySell Scraper — {datetime.utcnow().isoformat()} ===")
+    print(f"=== BizBuySell Scraper — {_now().isoformat()} ===")
 
     seen = load_seen()
     print(f"Previously seen listings: {len(seen)}")
