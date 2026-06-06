@@ -84,7 +84,7 @@ _session.headers.update(HEADERS)
 def _build_url(target_url: str) -> str:
     """Wrap target URL through ScraperAPI if a key is configured."""
     if SCRAPERAPI_KEY:
-        params = urlencode({"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "false"})
+        params = urlencode({"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "true"})
         return f"https://api.scraperapi.com?{params}"
     return target_url
 
