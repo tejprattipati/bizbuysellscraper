@@ -1,6 +1,7 @@
 """
 BizBuySell Agriculture Listings Scraper
-Fetches listings, applies filters, emails new ones since last run.
+Fetches listings via Playwright (headless Chromium), applies filters,
+emails new ones since last run.
 """
 
 import json
@@ -11,10 +12,9 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from urllib.parse import urlencode
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
 def _now() -> datetime:
@@ -30,67 +30,35 @@ BASE_URL = os.getenv(
 )
 
 def _env_float(key: str, default: str) -> float:
-    """Read env var as float, falling back to default if unset or empty."""
     return float(os.getenv(key, "") or default)
 
-# Price filter (listing asking price). Set to 0 / float('inf') to disable.
 PRICE_MIN = _env_float("PRICE_MIN", "500000")   # $500k
 PRICE_MAX = _env_float("PRICE_MAX", "7000000")  # $7M
-
-# Cash flow / EBITDA filter.
-CF_MIN = _env_float("CF_MIN", "300000")   # $300k
-CF_MAX = _env_float("CF_MAX", "2000000")  # $2M
+CF_MIN    = _env_float("CF_MIN",    "300000")   # $300k
+CF_MAX    = _env_float("CF_MAX",    "2000000")  # $2M
 
 # Location filter — comma-separated state abbreviations, or "ALL" to disable.
-# Example: "MA,NH,RI,CT,ME,VT,NY"  (within ~2hr drive of Boston)
 LOCATION_FILTER = os.getenv("LOCATION_FILTER", "ALL")
 
 # Keyword filter — comma-separated words that must appear in title/description.
-# Leave empty string to disable.
 KEYWORD_FILTER = os.getenv("KEYWORD_FILTER", "")
 
-# ScraperAPI key — routes requests through residential IPs to bypass bot blocks.
-# Free tier: 1,000 credits/month at https://scraperapi.com (enough for hourly runs).
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
-
 # Email settings
-GMAIL_USER = os.getenv("GMAIL_USER", "")          # your Gmail address
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # 16-char app password
-EMAIL_TO = os.getenv("EMAIL_TO", "tej.s.prattipati@gmail.com")
+GMAIL_USER        = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+EMAIL_TO          = os.getenv("EMAIL_TO", "tej.s.prattipati@gmail.com")
 
 # File that stores IDs of listings already seen/reported
 SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen_listings.json"))
 
 # Max pages to scrape per run
-MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "10") or "10")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-_session = requests.Session()
-_session.headers.update(HEADERS)
-
-
-def _build_url(target_url: str) -> str:
-    """Wrap target URL through ScraperAPI if a key is configured."""
-    if SCRAPERAPI_KEY:
-        params = urlencode({"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "true"})
-        return f"https://api.scraperapi.com?{params}"
-    return target_url
-
-
 def parse_dollar(text: str) -> float | None:
-    """Convert '$1,250,000' or '1.25M' style strings to a float."""
     if not text:
         return None
     text = text.strip().replace(",", "").replace("$", "").replace(" ", "")
@@ -122,137 +90,111 @@ def save_seen(seen: set) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scraping
+# Scraping with Playwright
 # ---------------------------------------------------------------------------
 
-def fetch_page(url: str, retries: int = 3) -> BeautifulSoup | None:
-    fetch_url = _build_url(url)
-    for attempt in range(retries):
-        try:
-            resp = _session.get(fetch_url, timeout=60)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                print(f"  Page title: {soup.title.string if soup.title else 'N/A'}")
-                # Debug: print condensed HTML structure to identify selectors
-                articles = soup.find_all("article")
-                divs_with_listing = soup.find_all("div", class_=lambda c: c and any(
-                    x in " ".join(c) for x in ("listing", "result", "card", "business")
-                ))
-                print(f"  <article> tags: {len(articles)}")
-                print(f"  divs with listing/result/card class: {len(divs_with_listing)}")
-                if divs_with_listing:
-                    sample = divs_with_listing[0]
-                    print(f"  First such div classes: {sample.get('class')}")
-                    print(f"  First such div text[:200]: {sample.get_text(' ', strip=True)[:200]}")
-                if not articles and not divs_with_listing:
-                    # Dump first 3000 chars of body so we can see what we got
-                    body = soup.find("body")
-                    print(f"  RAW BODY[:3000]:\n{str(body)[:3000] if body else resp.text[:3000]}")
-                return soup
-            print(f"HTTP {resp.status_code} for {url}")
-        except Exception as e:
-            print(f"Request error (attempt {attempt + 1}): {e}")
-        time.sleep(2 ** attempt)
-    return None
+def fetch_html(page, url: str) -> str | None:
+    """Navigate to url and return rendered HTML after listings load."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # Wait for listing cards to appear — try several known selectors
+        for selector in [
+            "div.listing-result",
+            "article.result",
+            ".listings article",
+            "[class*='listing-result']",
+            "[class*='ListingResult']",
+        ]:
+            try:
+                page.wait_for_selector(selector, timeout=15_000)
+                print(f"  Listings appeared with selector: {selector}")
+                break
+            except PWTimeout:
+                continue
+        else:
+            # None matched — dump a snippet so we can debug selectors
+            body_text = page.inner_text("body")[:500]
+            html_snippet = page.content()[:2000]
+            print(f"  WARNING: no listing selector matched.")
+            print(f"  Body text[:500]: {body_text}")
+            print(f"  HTML[:2000]: {html_snippet}")
+        time.sleep(2)  # small extra wait for lazy-loaded content
+        return page.content()
+    except Exception as e:
+        print(f"  Playwright error fetching {url}: {e}")
+        return None
 
 
-def extract_listings(soup: BeautifulSoup) -> list[dict]:
+def extract_listings(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # BizBuySell listing card selectors (try in order)
+    cards = (
+        soup.select("div.listing-result")
+        or soup.select("article.result")
+        or soup.select(".listings article")
+        or soup.find_all("article")
+        or soup.select("[class*='listing-result']")
+    )
+
+    print(f"  Raw card count: {len(cards)}")
+    if cards:
+        print(f"  Sample card classes: {cards[0].get('class')}")
+
     listings = []
-    # BizBuySell listing cards — selector may need updating if site changes
-    cards = soup.select("div.listings article") or soup.select("article.result")
-    if not cards:
-        # Fallback: grab any <article> tags
-        cards = soup.find_all("article")
-
     for card in cards:
         listing = {}
 
         # Title / URL
-        title_tag = card.find("a", class_=lambda c: c and "title" in c.lower()) or card.find("h2")
+        title_tag = (
+            card.find("a", class_=lambda c: c and "title" in " ".join(c).lower())
+            or card.find("h2")
+            or card.find("h3")
+            or card.find("a")
+        )
         if not title_tag:
-            title_tag = card.find("a")
-        if title_tag:
-            listing["title"] = title_tag.get_text(strip=True)
-            href = title_tag.get("href", "")
-            if href.startswith("/"):
-                href = "https://www.bizbuysell.com" + href
-            listing["url"] = href
-            # Use URL path as stable ID
-            listing["id"] = href.split("?")[0].rstrip("/")
-        else:
-            continue  # skip cards with no link
+            continue
+        listing["title"] = title_tag.get_text(strip=True)
+        href = title_tag.get("href", "")
+        if href.startswith("/"):
+            href = "https://www.bizbuysell.com" + href
+        listing["url"] = href
+        listing["id"] = href.split("?")[0].rstrip("/")
 
-        # Price / Cash Flow / Revenue — look for labeled data
-        def find_value(labels: list[str]) -> str:
-            for label in labels:
-                el = card.find(string=lambda t: t and label.lower() in t.lower())
-                if el:
-                    # value is usually in a sibling or nearby element
-                    parent = el.find_parent()
-                    if parent:
-                        sibling = parent.find_next_sibling()
-                        if sibling:
-                            return sibling.get_text(strip=True)
-                        # Try parent's next parent text
-                        return parent.get_text(strip=True).replace(label, "").strip()
-            return ""
-
-        # BizBuySell uses data- attributes or structured spans
-        def extract_stat(card, *keywords):
+        # Stats — BizBuySell uses labeled <li> items in a <ul class="stats">
+        def get_stat(*keywords: str) -> str:
             for kw in keywords:
-                # Try data attributes
+                # labeled list items
+                for li in card.select("ul.stats li, li"):
+                    txt = li.get_text(" ", strip=True)
+                    if kw.lower() in txt.lower():
+                        # value is usually the last span or the text after the label
+                        spans = li.find_all("span")
+                        if len(spans) >= 2:
+                            return spans[-1].get_text(strip=True)
+                        return txt
+                # data-label attributes
                 el = card.find(attrs={"data-label": lambda v: v and kw.lower() in v.lower()})
                 if el:
                     return el.get_text(strip=True)
-                # Try span/div with class containing keyword
-                el = card.find(class_=lambda c: c and kw.lower() in " ".join(c).lower() if isinstance(c, list) else kw.lower() in c.lower())
-                if el:
-                    return el.get_text(strip=True)
-                # Try text search
-                el = card.find(string=lambda t: t and kw.lower() in t.lower())
-                if el:
-                    p = el.find_parent()
-                    if p:
-                        nxt = p.find_next_sibling()
-                        if nxt:
-                            return nxt.get_text(strip=True)
             return ""
 
-        listing["price_text"] = extract_stat(card, "asking price", "listing price", "price")
-        listing["cf_text"] = extract_stat(card, "cash flow", "ebitda", "sde")
-        listing["revenue_text"] = extract_stat(card, "gross revenue", "revenue")
-        listing["location"] = extract_stat(card, "location") or ""
-
-        # Fallback: scrape visible text blocks that look like dollar amounts
-        # Many BizBuySell cards have a <ul class="stats"> structure
-        stats = card.select("ul.stats li, .businessInfo li, .listing-info li")
-        for stat in stats:
-            text = stat.get_text(" ", strip=True).lower()
-            value_el = stat.find("span") or stat
-            val = value_el.get_text(strip=True)
-            if "asking" in text or "price" in text:
-                if not listing["price_text"]:
-                    listing["price_text"] = val
-            elif "cash flow" in text or "ebitda" in text or "sde" in text:
-                if not listing["cf_text"]:
-                    listing["cf_text"] = val
-            elif "revenue" in text or "gross" in text:
-                if not listing["revenue_text"]:
-                    listing["revenue_text"] = val
-            elif any(s in text for s in ["city", "state", "location"]):
-                if not listing["location"]:
-                    listing["location"] = val
+        listing["price_text"]   = get_stat("asking price", "listing price", "price")
+        listing["cf_text"]      = get_stat("cash flow", "ebitda", "sde")
+        listing["revenue_text"] = get_stat("gross revenue", "revenue")
+        listing["location"]     = get_stat("location", "city", "state") or ""
 
         listing["price"] = parse_dollar(listing["price_text"])
-        listing["cf"] = parse_dollar(listing["cf_text"])
+        listing["cf"]    = parse_dollar(listing["cf_text"])
 
         listings.append(listing)
 
     return listings
 
 
-def get_next_page_url(soup: BeautifulSoup, current_url: str) -> str | None:
-    next_link = soup.select_one("a[rel='next'], .pagination .next a, li.next a")
+def get_next_page_url(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    next_link = soup.select_one("a[rel='next'], .pagination .next a, li.next a, a.next")
     if next_link:
         href = next_link.get("href", "")
         if href.startswith("/"):
@@ -263,20 +205,38 @@ def get_next_page_url(soup: BeautifulSoup, current_url: str) -> str | None:
 
 
 def scrape_all() -> list[dict]:
-    url = BASE_URL
     all_listings = []
-    for page_num in range(1, MAX_PAGES + 1):
-        print(f"Scraping page {page_num}: {url}")
-        soup = fetch_page(url)
-        if not soup:
-            break
-        page_listings = extract_listings(soup)
-        print(f"  Found {len(page_listings)} listings on page {page_num}")
-        all_listings.extend(page_listings)
-        url = get_next_page_url(soup, url)
-        if not url:
-            break
-        time.sleep(2)  # polite delay between pages
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        page = ctx.new_page()
+        # Block images/fonts to speed up loading
+        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+
+        url = BASE_URL
+        for page_num in range(1, MAX_PAGES + 1):
+            print(f"Scraping page {page_num}: {url}")
+            html = fetch_html(page, url)
+            if not html:
+                break
+            page_listings = extract_listings(html)
+            print(f"  Found {len(page_listings)} listings on page {page_num}")
+            all_listings.extend(page_listings)
+            next_url = get_next_page_url(html)
+            if not next_url:
+                break
+            url = next_url
+            time.sleep(2)
+
+        browser.close()
     return all_listings
 
 
@@ -285,19 +245,15 @@ def scrape_all() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def passes_filters(listing: dict) -> tuple[bool, list[str]]:
-    """Return (passes, list_of_reasons_excluded)."""
     reasons = []
 
-    # Price filter
     price = listing.get("price")
     if price is not None:
         if price < PRICE_MIN:
             reasons.append(f"Price ${price:,.0f} < min ${PRICE_MIN:,.0f}")
         elif price > PRICE_MAX:
             reasons.append(f"Price ${price:,.0f} > max ${PRICE_MAX:,.0f}")
-    # If price not disclosed, let it through (we can't disqualify unknown)
 
-    # Cash flow filter
     cf = listing.get("cf")
     if cf is not None:
         if cf < CF_MIN:
@@ -305,14 +261,12 @@ def passes_filters(listing: dict) -> tuple[bool, list[str]]:
         elif cf > CF_MAX:
             reasons.append(f"Cash flow ${cf:,.0f} > max ${CF_MAX:,.0f}")
 
-    # Location filter
     if LOCATION_FILTER and LOCATION_FILTER.upper() != "ALL":
-        allowed_states = [s.strip().upper() for s in LOCATION_FILTER.split(",")]
+        allowed = [s.strip().upper() for s in LOCATION_FILTER.split(",")]
         loc = listing.get("location", "").upper()
-        if not any(state in loc for state in allowed_states):
-            reasons.append(f"Location '{listing.get('location')}' not in {allowed_states}")
+        if not any(s in loc for s in allowed):
+            reasons.append(f"Location '{listing.get('location')}' not in {allowed}")
 
-    # Keyword filter
     if KEYWORD_FILTER:
         keywords = [k.strip().lower() for k in KEYWORD_FILTER.split(",") if k.strip()]
         text = (listing.get("title", "") + " " + listing.get("location", "")).lower()
@@ -331,7 +285,7 @@ def build_email_html(new_listings: list[dict]) -> str:
     rows = ""
     for l in new_listings:
         price = f"${l['price']:,.0f}" if l.get("price") else l.get("price_text") or "N/A"
-        cf = f"${l['cf']:,.0f}" if l.get("cf") else l.get("cf_text") or "N/A"
+        cf    = f"${l['cf']:,.0f}"    if l.get("cf")    else l.get("cf_text")    or "N/A"
         rows += f"""
         <tr>
             <td style="padding:8px;border-bottom:1px solid #eee;">
@@ -380,11 +334,10 @@ def send_email(new_listings: list[dict]) -> None:
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"[BizBuySell] {len(new_listings)} New Agriculture Listing(s)"
-    msg["From"] = GMAIL_USER
-    msg["To"] = EMAIL_TO
+    msg["From"]    = GMAIL_USER
+    msg["To"]      = EMAIL_TO
 
-    html = build_email_html(new_listings)
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(build_email_html(new_listings), "html"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
