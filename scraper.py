@@ -24,13 +24,17 @@ BASE_URL = os.getenv(
     "https://www.bizbuysell.com/agriculture-businesses-for-sale/?q=bHQ9MzAsNDAsODA%3D",
 )
 
+def _env_float(key: str, default: str) -> float:
+    """Read env var as float, falling back to default if unset or empty."""
+    return float(os.getenv(key, "") or default)
+
 # Price filter (listing asking price). Set to 0 / float('inf') to disable.
-PRICE_MIN = float(os.getenv("PRICE_MIN", "500000"))   # $500k
-PRICE_MAX = float(os.getenv("PRICE_MAX", "7000000"))  # $7M
+PRICE_MIN = _env_float("PRICE_MIN", "500000")   # $500k
+PRICE_MAX = _env_float("PRICE_MAX", "7000000")  # $7M
 
 # Cash flow / EBITDA filter.
-CF_MIN = float(os.getenv("CF_MIN", "300000"))   # $300k
-CF_MAX = float(os.getenv("CF_MAX", "2000000"))  # $2M
+CF_MIN = _env_float("CF_MIN", "300000")   # $300k
+CF_MAX = _env_float("CF_MAX", "2000000")  # $2M
 
 # Location filter — comma-separated state abbreviations, or "ALL" to disable.
 # Example: "MA,NH,RI,CT,ME,VT,NY"  (within ~2hr drive of Boston)
