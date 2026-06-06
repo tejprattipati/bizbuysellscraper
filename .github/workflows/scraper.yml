@@ -33,6 +33,7 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
           # Optional overrides — set these as repo secrets or remove to use defaults
           PRICE_MIN: ${{ vars.PRICE_MIN }}
           PRICE_MAX: ${{ vars.PRICE_MAX }}

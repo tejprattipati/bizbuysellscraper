@@ -8,19 +8,17 @@ import os
 import smtplib
 import time
 from datetime import datetime, timezone
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlencode
 
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 
-_scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 # ---------------------------------------------------------------------------
 # Configuration — override any of these via environment variables
@@ -51,10 +49,14 @@ LOCATION_FILTER = os.getenv("LOCATION_FILTER", "ALL")
 # Leave empty string to disable.
 KEYWORD_FILTER = os.getenv("KEYWORD_FILTER", "")
 
+# ScraperAPI key — routes requests through residential IPs to bypass bot blocks.
+# Free tier: 1,000 credits/month at https://scraperapi.com (enough for hourly runs).
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "")
+
 # Email settings
 GMAIL_USER = os.getenv("GMAIL_USER", "")          # your Gmail address
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")  # 16-char app password
-EMAIL_TO = os.getenv("EMAIL_TO", "krackerjackp@gmail.com")
+EMAIL_TO = os.getenv("EMAIL_TO", "tej.s.prattipati@gmail.com")
 
 # File that stores IDs of listings already seen/reported
 SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen_listings.json"))
@@ -74,6 +76,17 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+_session = requests.Session()
+_session.headers.update(HEADERS)
+
+
+def _build_url(target_url: str) -> str:
+    """Wrap target URL through ScraperAPI if a key is configured."""
+    if SCRAPERAPI_KEY:
+        params = urlencode({"api_key": SCRAPERAPI_KEY, "url": target_url, "render": "false"})
+        return f"https://api.scraperapi.com?{params}"
+    return target_url
 
 
 def parse_dollar(text: str) -> float | None:
@@ -113,9 +126,10 @@ def save_seen(seen: set) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_page(url: str, retries: int = 3) -> BeautifulSoup | None:
+    fetch_url = _build_url(url)
     for attempt in range(retries):
         try:
-            resp = _scraper.get(url, headers=HEADERS, timeout=30)
+            resp = _session.get(fetch_url, timeout=60)
             if resp.status_code == 200:
                 return BeautifulSoup(resp.text, "html.parser")
             print(f"HTTP {resp.status_code} for {url}")
