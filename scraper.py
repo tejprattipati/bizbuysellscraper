@@ -131,7 +131,24 @@ def fetch_page(url: str, retries: int = 3) -> BeautifulSoup | None:
         try:
             resp = _session.get(fetch_url, timeout=60)
             if resp.status_code == 200:
-                return BeautifulSoup(resp.text, "html.parser")
+                soup = BeautifulSoup(resp.text, "html.parser")
+                print(f"  Page title: {soup.title.string if soup.title else 'N/A'}")
+                # Debug: print condensed HTML structure to identify selectors
+                articles = soup.find_all("article")
+                divs_with_listing = soup.find_all("div", class_=lambda c: c and any(
+                    x in " ".join(c) for x in ("listing", "result", "card", "business")
+                ))
+                print(f"  <article> tags: {len(articles)}")
+                print(f"  divs with listing/result/card class: {len(divs_with_listing)}")
+                if divs_with_listing:
+                    sample = divs_with_listing[0]
+                    print(f"  First such div classes: {sample.get('class')}")
+                    print(f"  First such div text[:200]: {sample.get_text(' ', strip=True)[:200]}")
+                if not articles and not divs_with_listing:
+                    # Dump first 3000 chars of body so we can see what we got
+                    body = soup.find("body")
+                    print(f"  RAW BODY[:3000]:\n{str(body)[:3000] if body else resp.text[:3000]}")
+                return soup
             print(f"HTTP {resp.status_code} for {url}")
         except Exception as e:
             print(f"Request error (attempt {attempt + 1}): {e}")
