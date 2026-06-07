@@ -206,6 +206,8 @@ def get_next_page_url(html: str) -> str | None:
 
 
 def scrape_all() -> list[dict]:
+    import random
+
     all_listings = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -214,23 +216,27 @@ def scrape_all() -> list[dict]:
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1280,800",
             ],
         )
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/134.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
             locale="en-US",
             java_script_enabled=True,
-            # Mimic real browser accept headers
             extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
                 "Upgrade-Insecure-Requests": "1",
+                "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"Windows"',
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
@@ -240,7 +246,16 @@ def scrape_all() -> list[dict]:
         page = ctx.new_page()
         # Apply stealth patches — removes navigator.webdriver and other bot signals
         stealth_sync(page)
-        # Block images/fonts to speed up loading
+
+        # Warm up: visit the homepage first to establish session cookies
+        print("Warming up session via homepage...")
+        try:
+            page.goto("https://www.bizbuysell.com/", wait_until="domcontentloaded", timeout=60_000)
+            time.sleep(random.uniform(2, 4))
+        except Exception as e:
+            print(f"  Homepage warm-up failed (continuing): {e}")
+
+        # Block images/fonts only after warm-up to avoid triggering bot checks on first load
         page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
 
         url = BASE_URL
@@ -256,7 +271,7 @@ def scrape_all() -> list[dict]:
             if not next_url:
                 break
             url = next_url
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
 
         browser.close()
     return all_listings
