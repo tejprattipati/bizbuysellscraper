@@ -15,6 +15,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright_stealth import stealth_sync
 
 
 def _now() -> datetime:
@@ -207,7 +208,14 @@ def get_next_page_url(html: str) -> str | None:
 def scrape_all() -> list[dict]:
     all_listings = []
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         ctx = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -216,8 +224,22 @@ def scrape_all() -> list[dict]:
             ),
             viewport={"width": 1280, "height": 800},
             locale="en-US",
+            java_script_enabled=True,
+            # Mimic real browser accept headers
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            },
         )
         page = ctx.new_page()
+        # Apply stealth patches — removes navigator.webdriver and other bot signals
+        stealth_sync(page)
         # Block images/fonts to speed up loading
         page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
 
