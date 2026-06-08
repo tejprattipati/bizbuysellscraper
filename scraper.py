@@ -172,66 +172,76 @@ def fetch_html(session: Session, url: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def extract_listings(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
+    # Primary: parse BBS-state JSON (Angular SSR embeds all listing data here)
+    raw = _extract_bbs_state(html)
+    if raw is not None:
+        print(f"  BBS-state JSON found: {len(raw)} raw listings")
+        listings = []
+        for item in raw:
+            url = item.get("urlStub", "")
+            listing_id = str(item.get("listNumber", "")) or url.split("?")[0].rstrip("/")
+            price = item.get("price")
+            cf = item.get("cashFlow") or item.get("ebitda")
+            listings.append({
+                "id": listing_id,
+                "title": item.get("header", ""),
+                "url": url,
+                "location": item.get("location", ""),
+                "price": float(price) if price is not None else None,
+                "cf": float(cf) if cf is not None else None,
+                "price_text": f"${price:,}" if price is not None else "N/A",
+                "cf_text": f"${cf:,}" if cf is not None else "N/A",
+                "description": item.get("description", ""),
+                "region": item.get("region", ""),
+            })
+        return listings
 
-    # BizBuySell listing card selectors (try in order)
+    # Fallback: HTML element selectors (for future layout changes)
+    soup = BeautifulSoup(html, "html.parser")
     cards = (
         soup.select("div.listing-result")
         or soup.select("article.result")
         or soup.select(".listings article")
         or soup.find_all("article")
-        or soup.select("[class*='listing-result']")
     )
-
-    print(f"  Raw card count: {len(cards)}")
-    if cards:
-        print(f"  Sample card classes: {cards[0].get('class')}")
+    print(f"  BBS-state not found; HTML card count: {len(cards)}")
 
     listings = []
     for card in cards:
-        listing = {}
-
-        # Title / URL
         title_tag = (
             card.find("a", class_=lambda c: c and "title" in " ".join(c).lower())
-            or card.find("h2")
-            or card.find("h3")
-            or card.find("a")
+            or card.find("h2") or card.find("h3") or card.find("a")
         )
         if not title_tag:
             continue
-        listing["title"] = title_tag.get_text(strip=True)
         href = title_tag.get("href", "")
         if href.startswith("/"):
             href = "https://www.bizbuysell.com" + href
-        listing["url"] = href
-        listing["id"] = href.split("?")[0].rstrip("/")
 
-        # Stats — BizBuySell uses labeled <li> items in a <ul class="stats">
         def get_stat(*keywords: str) -> str:
             for kw in keywords:
                 for li in card.select("ul.stats li, li"):
                     txt = li.get_text(" ", strip=True)
                     if kw.lower() in txt.lower():
                         spans = li.find_all("span")
-                        if len(spans) >= 2:
-                            return spans[-1].get_text(strip=True)
-                        return txt
+                        return spans[-1].get_text(strip=True) if len(spans) >= 2 else txt
                 el = card.find(attrs={"data-label": lambda v: v and kw.lower() in v.lower()})
                 if el:
                     return el.get_text(strip=True)
             return ""
 
-        listing["price_text"]   = get_stat("asking price", "listing price", "price")
-        listing["cf_text"]      = get_stat("cash flow", "ebitda", "sde")
-        listing["revenue_text"] = get_stat("gross revenue", "revenue")
-        listing["location"]     = get_stat("location", "city", "state") or ""
-
-        listing["price"] = parse_dollar(listing["price_text"])
-        listing["cf"]    = parse_dollar(listing["cf_text"])
-
-        listings.append(listing)
-
+        price_text = get_stat("asking price", "listing price", "price")
+        cf_text = get_stat("cash flow", "ebitda", "sde")
+        listings.append({
+            "id": href.split("?")[0].rstrip("/"),
+            "title": title_tag.get_text(strip=True),
+            "url": href,
+            "location": get_stat("location", "city", "state"),
+            "price": parse_dollar(price_text),
+            "cf": parse_dollar(cf_text),
+            "price_text": price_text,
+            "cf_text": cf_text,
+        })
     return listings
 
 
@@ -286,14 +296,42 @@ def scrape_all() -> list[dict]:
 # Diagnose mode — inspect raw rendered HTML and CSS structure
 # ---------------------------------------------------------------------------
 
+def _extract_bbs_state(html: str) -> list[dict] | None:
+    """Extract listing objects from the BBS-state JSON script tag, or None."""
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", {"id": "BBS-state"})
+    if not tag:
+        return None
+    try:
+        data = json.loads(tag.string)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    # Navigate nested structure: top-level keys are API endpoint names;
+    # find the one containing bfsSearchResult.value (a list of listings).
+    for top_val in data.values():
+        if not isinstance(top_val, dict):
+            continue
+        inner = top_val.get("value", {})
+        if not isinstance(inner, dict):
+            continue
+        bfs = inner.get("bfsSearchResult", {})
+        if isinstance(bfs, dict):
+            listings = bfs.get("value", [])
+            if isinstance(listings, list) and listings:
+                return listings
+    return None
+
+
 def _classify_response(html: str, status: int) -> str:
-    """Return one of: ACCESS_DENIED | AKAMAI_CHALLENGE | REAL_PAGE"""
+    """Return one of: ACCESS_DENIED | AKAMAI_JS_CHALLENGE | REAL_PAGE | UNKNOWN"""
     if status != 200:
         return f"HTTP_{status}"
     if "Access Denied" in html[:600] and len(html) < 2000:
         return "ACCESS_DENIED"
     if "akamai" in html.lower()[:2000] and "behavioral" in html.lower()[:2000]:
         return "AKAMAI_JS_CHALLENGE"
+    if 'id="BBS-state"' in html or "BBS-state" in html:
+        return "REAL_PAGE"
     if "bizbuysell" in html.lower() and len(html) > 5000:
         return "REAL_PAGE"
     return f"UNKNOWN (len={len(html)})"
@@ -340,45 +378,57 @@ def diagnose_page(url: str = BASE_URL) -> None:
 
     html = best_html or ""
     soup = BeautifulSoup(html, "html.parser")
-
-    all_classes = sorted({
-        c
-        for tag in soup.find_all(True)
-        for c in (tag.get("class") or [])
-    })
-    keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
-    candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
-    article_count = len(soup.find_all("article"))
-    section_count = len(soup.find_all("section"))
-    body_text = soup.get_text(" ", strip=True)
     verdict = _classify_response(html, best_status or 0)
+    bbs_listings = _extract_bbs_state(html)
 
     print("\n" + "=" * 70)
     print(f"BEST PROFILE:     {best_profile}")
     print(f"HTTP STATUS:      {best_status}")
     print(f"VERDICT:          {verdict}")
     print(f"PAGE TITLE:       {soup.title.string if soup.title else '(none)'}")
-    print(f"<article> tags:   {article_count}")
-    print(f"<section> tags:   {section_count}")
-    print(f"Total CSS classes: {len(all_classes)}")
-    print(f"\nCANDIDATE LISTING SELECTORS ({len(candidates)}):")
-    for c in candidates:
-        print(f"  .{c}")
-    print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:800]}")
-    print(f"\nHTML SNIPPET (first 4000 chars):\n{html[:4000]}")
+    print(f"HTML LENGTH:      {len(html):,} bytes")
+
+    if bbs_listings is not None:
+        print(f"\nBBS-STATE JSON:   FOUND — {len(bbs_listings)} listings")
+        for i, item in enumerate(bbs_listings[:3]):
+            print(f"\n  Listing #{i+1}:")
+            print(f"    title:    {item.get('title','')[:80]}")
+            print(f"    location: {item.get('location','')}")
+            price = item.get('price')
+            cf = item.get('cf')
+            print(f"    price:    ${price:,.0f}" if price else "    price:    N/A")
+            print(f"    cf:       ${cf:,.0f}" if cf else "    cf:       N/A")
+            print(f"    url:      {item.get('url','')}")
+        if len(bbs_listings) > 3:
+            print(f"\n  ... and {len(bbs_listings) - 3} more")
+    else:
+        print("\nBBS-STATE JSON:   NOT FOUND")
+        all_classes = sorted({
+            c
+            for tag in soup.find_all(True)
+            for c in (tag.get("class") or [])
+        })
+        keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
+        candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
+        print(f"<article> tags:   {len(soup.find_all('article'))}")
+        print(f"Total CSS classes: {len(all_classes)}")
+        print(f"Candidate selectors: {candidates[:20]}")
+        body_text = soup.get_text(" ", strip=True)
+        print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:600]}")
+        print(f"\nHTML SNIPPET (first 2000 chars):\n{html[:2000]}")
+
     print("=" * 70)
 
     if verdict == "AKAMAI_JS_CHALLENGE":
-        print("\n⚠  AKAMAI JS CHALLENGE ACTIVE")
-        print("   curl_cffi cannot execute the behavioral JavaScript challenge.")
-        print("   Options to bypass this:")
-        print("   1. ScraperAPI (https://scraperapi.com) — has BizBuySell support built-in")
-        print("   2. Scrapfly (https://scrapfly.io) — handles Akamai specifically")
-        print("   3. Residential proxy + curl_cffi (challenge may not fire on residential IPs)")
-        print("   Set SCRAPER_API_KEY env var to use ScraperAPI automatically.")
+        print("\nAKAMAI JS CHALLENGE ACTIVE — curl_cffi cannot execute behavioral JS.")
+        print("Options:")
+        print("  1. ScraperAPI (scraperapi.com) — set SCRAPER_API_KEY secret")
+        print("  2. Scrapfly (scrapfly.io) — handles Akamai specifically")
+        print("  3. Residential proxy + curl_cffi")
     elif verdict == "REAL_PAGE":
-        print(f"\n✓  Successfully retrieved real page content with profile '{best_profile}'")
-        print("   Update CHROME_PROFILE env var to lock in this profile.")
+        print(f"\nReal page retrieved with profile '{best_profile}'.")
+        if bbs_listings:
+            print(f"extract_listings() will return {len(bbs_listings)} listings from BBS-state JSON.")
 
 
 # ---------------------------------------------------------------------------
