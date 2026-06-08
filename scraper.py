@@ -96,7 +96,7 @@ def save_seen(seen: set) -> None:
 
 def _make_session() -> Session:
     """curl_cffi session that impersonates Chrome's TLS/HTTP2 fingerprint."""
-    session = Session(impersonate="chrome134")
+    session = Session(impersonate="chrome131")
     session.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
