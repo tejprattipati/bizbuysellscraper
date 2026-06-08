@@ -15,7 +15,6 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from playwright_stealth import stealth_sync
 
 
 def _now() -> datetime:
@@ -244,8 +243,18 @@ def scrape_all() -> list[dict]:
             },
         )
         page = ctx.new_page()
-        # Apply stealth patches — removes navigator.webdriver and other bot signals
-        stealth_sync(page)
+        # Inline stealth patches — removes navigator.webdriver and other bot signals
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            window.chrome = {runtime: {}};
+            const orig = navigator.permissions.query;
+            navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({state: Notification.permission})
+                    : orig(params);
+        """)
 
         # Warm up: visit the homepage first to establish session cookies
         print("Warming up session via homepage...")
