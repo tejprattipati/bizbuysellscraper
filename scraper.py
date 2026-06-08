@@ -128,20 +128,20 @@ def _make_session(profile: str | None = None) -> Session:
     return session
 
 
-def fetch_html(session: Session, url: str) -> str | None:
+def fetch_html(session: Session, url: str, scrapfly_client=None) -> str | None:
     """Fetch HTML for url, using Scrapfly (asp=True) when key is set."""
     if SCRAPFLY_API_KEY:
-        return _fetch_via_scrapfly(url)
+        return _fetch_via_scrapfly(url, client=scrapfly_client)
     if SCRAPER_API_KEY:
         return _fetch_via_scraperapi(url)
     return _fetch_direct(session, url)
 
 
-def _fetch_via_scrapfly(url: str) -> str | None:
+def _fetch_via_scrapfly(url: str, client=None) -> str | None:
     try:
         from scrapfly import ScrapflyClient, ScrapeConfig
-        client = ScrapflyClient(key=SCRAPFLY_API_KEY)
-        result = client.scrape(ScrapeConfig(
+        _client = client or ScrapflyClient(key=SCRAPFLY_API_KEY)
+        result = _client.scrape(ScrapeConfig(
             url=url,
             asp=True,         # Akamai bypass
             render_js=True,   # Required: Scrapfly needs JS rendering to pass Akamai behavioral challenge
@@ -228,10 +228,13 @@ def extract_listings(html: str) -> list[dict]:
             })
         return listings
 
-    # Fallback: HTML element selectors (for future layout changes)
+    # Fallback: HTML card selectors.
+    # BizBuySell uses .diamond / .showcase / .basic for listing tiers.
+    # After Angular hydration, BBS-state script tag is removed — these cards remain.
     soup = BeautifulSoup(html, "html.parser")
     cards = (
-        soup.select("div.listing-result")
+        soup.select("div.diamond, div.showcase, div.basic")
+        or soup.select("div.listing-result")
         or soup.select("article.result")
         or soup.select(".listings article")
         or soup.find_all("article")
@@ -277,7 +280,8 @@ def extract_listings(html: str) -> list[dict]:
     return listings
 
 
-def get_next_page_url(html: str) -> str | None:
+def get_next_page_url(html: str, current_page: int, current_url: str) -> str | None:
+    # Primary: look for rel=next or pagination links in HTML
     soup = BeautifulSoup(html, "html.parser")
     next_link = soup.select_one("a[rel='next'], .pagination .next a, li.next a, a.next")
     if next_link:
@@ -286,7 +290,23 @@ def get_next_page_url(html: str) -> str | None:
             return "https://www.bizbuysell.com" + href
         if href.startswith("http"):
             return href
-    return None
+
+    # Fallback: BizBuySell pagination uses /{n}/ path segments.
+    # e.g. /agriculture-businesses-for-sale/?q=... -> /agriculture-businesses-for-sale/2/?q=...
+    # or   /agriculture-businesses-for-sale/2/?q=... -> /agriculture-businesses-for-sale/3/?q=...
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(current_url)
+    path = parsed.path.rstrip("/")
+
+    # Remove existing page number suffix if present (e.g. .../2 -> ...)
+    import re
+    path = re.sub(r"/\d+$", "", path)
+    next_path = f"{path}/{current_page + 1}/"
+    next_url = urlunparse(parsed._replace(path=next_path))
+
+    # Only return the guessed URL if the current page actually had listings
+    # (avoids infinite loop on last page — caller checks listing count)
+    return next_url
 
 
 # ---------------------------------------------------------------------------
@@ -297,25 +317,34 @@ def scrape_all() -> list[dict]:
     all_listings = []
     session = _make_session()
 
-    # Warm up: visit the homepage to establish session cookies
-    print("Warming up session via homepage...")
-    try:
-        resp = session.get("https://www.bizbuysell.com/", timeout=30)
-        print(f"  Homepage status: {resp.status_code}")
-        time.sleep(random.uniform(2, 4))
-    except Exception as e:
-        print(f"  Homepage warm-up failed (continuing): {e}")
+    # Create Scrapfly client once for the whole run (avoid per-request overhead)
+    scrapfly_client = None
+    if SCRAPFLY_API_KEY:
+        from scrapfly import ScrapflyClient
+        scrapfly_client = ScrapflyClient(key=SCRAPFLY_API_KEY)
+        print("Using Scrapfly for Akamai bypass.")
+    else:
+        # Warm up only when using direct curl_cffi — Scrapfly manages its own session
+        print("Warming up session via homepage...")
+        try:
+            resp = session.get("https://www.bizbuysell.com/", timeout=30)
+            print(f"  Homepage status: {resp.status_code}")
+            time.sleep(random.uniform(2, 4))
+        except Exception as e:
+            print(f"  Homepage warm-up failed (continuing): {e}")
 
     url = BASE_URL
     for page_num in range(1, MAX_PAGES + 1):
         print(f"Scraping page {page_num}: {url}")
-        html = fetch_html(session, url)
+        html = fetch_html(session, url, scrapfly_client=scrapfly_client)
         if not html:
             break
         page_listings = extract_listings(html)
         print(f"  Found {len(page_listings)} listings on page {page_num}")
+        if not page_listings:
+            break  # empty page = past the last page
         all_listings.extend(page_listings)
-        next_url = get_next_page_url(html)
+        next_url = get_next_page_url(html, page_num, url)
         if not next_url:
             break
         url = next_url
@@ -380,8 +409,10 @@ def diagnose_page(url: str = BASE_URL) -> None:
 
     # --- Try Scrapfly first if key is configured ---
     if SCRAPFLY_API_KEY:
+        from scrapfly import ScrapflyClient
+        _sf_client = ScrapflyClient(key=SCRAPFLY_API_KEY)
         print(f"\n[probe] scrapfly (asp=True) ...", end=" ", flush=True)
-        html = _fetch_via_scrapfly(url)
+        html = _fetch_via_scrapfly(url, client=_sf_client)
         if html:
             verdict = _classify_response(html, 200)
             print(f"→ {verdict}  (html len={len(html)})")
@@ -440,20 +471,28 @@ def diagnose_page(url: str = BASE_URL) -> None:
         if len(bbs_listings) > 3:
             print(f"\n  ... and {len(bbs_listings) - 3} more")
     else:
-        print("\nBBS-STATE JSON:   NOT FOUND")
-        all_classes = sorted({
-            c
-            for tag in soup.find_all(True)
-            for c in (tag.get("class") or [])
-        })
-        keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
-        candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
-        print(f"<article> tags:   {len(soup.find_all('article'))}")
-        print(f"Total CSS classes: {len(all_classes)}")
-        print(f"Candidate selectors: {candidates[:20]}")
-        body_text = soup.get_text(" ", strip=True)
-        print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:600]}")
-        print(f"\nHTML SNIPPET (first 2000 chars):\n{html[:2000]}")
+        print("\nBBS-STATE JSON:   NOT FOUND (expected after Angular hydration with render_js=True)")
+        diamond = soup.select("div.diamond, div.showcase, div.basic")
+        print(f"Listing cards (.diamond/.showcase/.basic): {len(diamond)}")
+        if diamond:
+            print("  Card fallback will be used for extraction.")
+            sample = diamond[0]
+            a = sample.find("a")
+            print(f"  Sample card title/href: {a.get_text(strip=True)[:60] if a else '?'} | {a.get('href','?') if a else '?'}")
+        else:
+            all_classes = sorted({
+                c
+                for tag in soup.find_all(True)
+                for c in (tag.get("class") or [])
+            })
+            keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
+            candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
+            print(f"<article> tags:   {len(soup.find_all('article'))}")
+            print(f"Total CSS classes: {len(all_classes)}")
+            print(f"Candidate selectors: {candidates[:20]}")
+            body_text = soup.get_text(" ", strip=True)
+            print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:600]}")
+            print(f"\nHTML SNIPPET (first 2000 chars):\n{html[:2000]}")
 
     print("=" * 70)
 
@@ -477,18 +516,20 @@ def passes_filters(listing: dict) -> tuple[bool, list[str]]:
     reasons = []
 
     price = listing.get("price")
-    if price is not None:
-        if price < PRICE_MIN:
-            reasons.append(f"Price ${price:,.0f} < min ${PRICE_MIN:,.0f}")
-        elif price > PRICE_MAX:
-            reasons.append(f"Price ${price:,.0f} > max ${PRICE_MAX:,.0f}")
+    if price is None:
+        reasons.append("Price not disclosed")
+    elif price < PRICE_MIN:
+        reasons.append(f"Price ${price:,.0f} < min ${PRICE_MIN:,.0f}")
+    elif price > PRICE_MAX:
+        reasons.append(f"Price ${price:,.0f} > max ${PRICE_MAX:,.0f}")
 
     cf = listing.get("cf")
-    if cf is not None:
-        if cf < CF_MIN:
-            reasons.append(f"Cash flow ${cf:,.0f} < min ${CF_MIN:,.0f}")
-        elif cf > CF_MAX:
-            reasons.append(f"Cash flow ${cf:,.0f} > max ${CF_MAX:,.0f}")
+    if cf is None:
+        reasons.append("Cash flow not disclosed")
+    elif cf < CF_MIN:
+        reasons.append(f"Cash flow ${cf:,.0f} < min ${CF_MIN:,.0f}")
+    elif cf > CF_MAX:
+        reasons.append(f"Cash flow ${cf:,.0f} > max ${CF_MAX:,.0f}")
 
     if LOCATION_FILTER and LOCATION_FILTER.upper() != "ALL":
         allowed = [s.strip().upper() for s in LOCATION_FILTER.split(",")]
