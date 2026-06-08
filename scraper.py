@@ -204,57 +204,135 @@ def get_next_page_url(html: str) -> str | None:
     return None
 
 
+def _make_browser_context(pw):
+    """Shared browser + context setup used by both scrape_all and diagnose_page."""
+    browser = pw.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--window-size=1280,800",
+        ],
+    )
+    ctx = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/134.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 800},
+        locale="en-US",
+        java_script_enabled=True,
+        extra_http_headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        },
+    )
+    page = ctx.new_page()
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        window.chrome = {runtime: {}};
+        const orig = navigator.permissions.query;
+        navigator.permissions.query = (params) =>
+            params.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : orig(params);
+    """)
+    return browser, ctx, page
+
+
+def diagnose_page(url: str = BASE_URL) -> dict:
+    """
+    Navigate to `url`, let JS render fully, then return a diagnostic dict with:
+      - page_title
+      - visible_text_sample  (first 800 chars of body text)
+      - all_classes          (every unique CSS class found in the DOM)
+      - candidate_selectors  (classes that look like listing containers)
+      - html_snippet         (first 4000 chars of rendered HTML)
+    Prints a formatted report and returns the dict so callers can inspect it.
+    """
+    with sync_playwright() as pw:
+        browser, ctx, page = _make_browser_context(pw)
+
+        print(f"[diagnose] Warming up via homepage...")
+        try:
+            page.goto("https://www.bizbuysell.com/", wait_until="domcontentloaded", timeout=60_000)
+            time.sleep(3)
+        except Exception as e:
+            print(f"[diagnose] Homepage load failed (continuing): {e}")
+
+        print(f"[diagnose] Loading target URL: {url}")
+        try:
+            page.goto(url, wait_until="networkidle", timeout=90_000)
+        except PWTimeout:
+            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(5)  # let lazy-loaded content settle
+
+        html = page.content()
+        body_text = page.inner_text("body")
+
+        # Collect every unique CSS class in the rendered DOM
+        all_classes: list[str] = page.evaluate("""() => {
+            const cls = new Set();
+            document.querySelectorAll('[class]').forEach(el => {
+                el.className.toString().split(/\\s+/).forEach(c => { if (c) cls.add(c); });
+            });
+            return [...cls].sort();
+        }""")
+
+        # Heuristic: classes that look like listing/result/card containers
+        keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
+        candidate_selectors = [c for c in all_classes if any(k in c.lower() for k in keywords)]
+
+        soup = BeautifulSoup(html, "html.parser")
+        article_count = len(soup.find_all("article"))
+        section_count = len(soup.find_all("section"))
+
+        report = {
+            "page_title": page.title(),
+            "visible_text_sample": body_text[:800],
+            "article_tags": article_count,
+            "section_tags": section_count,
+            "all_classes_count": len(all_classes),
+            "candidate_selectors": candidate_selectors,
+            "html_snippet": html[:4000],
+        }
+
+        print("\n" + "=" * 70)
+        print(f"PAGE TITLE:       {report['page_title']}")
+        print(f"<article> tags:   {article_count}")
+        print(f"<section> tags:   {section_count}")
+        print(f"Total CSS classes: {len(all_classes)}")
+        print(f"\nCANDIDATE LISTING SELECTORS ({len(candidate_selectors)}):")
+        for c in candidate_selectors:
+            print(f"  .{c}")
+        print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:800]}")
+        print(f"\nHTML SNIPPET (first 4000 chars):\n{html[:4000]}")
+        print("=" * 70)
+
+        browser.close()
+        return report
+
+
 def scrape_all() -> list[dict]:
     import random
 
     all_listings = []
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--window-size=1280,800",
-            ],
-        )
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/134.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            java_script_enabled=True,
-            extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
-                "Sec-CH-UA-Mobile": "?0",
-                "Sec-CH-UA-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-            },
-        )
-        page = ctx.new_page()
-        # Inline stealth patches — removes navigator.webdriver and other bot signals
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
-            const orig = navigator.permissions.query;
-            navigator.permissions.query = (params) =>
-                params.name === 'notifications'
-                    ? Promise.resolve({state: Notification.permission})
-                    : orig(params);
-        """)
+        browser, ctx, page = _make_browser_context(pw)
 
         # Warm up: visit the homepage first to establish session cookies
         print("Warming up session via homepage...")
@@ -396,6 +474,15 @@ def send_email(new_listings: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
+    import sys
+    if "--diagnose" in sys.argv:
+        url = BASE_URL
+        for arg in sys.argv[1:]:
+            if arg.startswith("http"):
+                url = arg
+        diagnose_page(url)
+        return
+
     print(f"=== BizBuySell Scraper — {_now().isoformat()} ===")
 
     seen = load_seen()
