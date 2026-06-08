@@ -392,13 +392,13 @@ def diagnose_page(url: str = BASE_URL) -> None:
         print(f"\nBBS-STATE JSON:   FOUND — {len(bbs_listings)} listings")
         for i, item in enumerate(bbs_listings[:3]):
             print(f"\n  Listing #{i+1}:")
-            print(f"    title:    {item.get('title','')[:80]}")
+            print(f"    title:    {item.get('header','')[:80]}")
             print(f"    location: {item.get('location','')}")
             price = item.get('price')
-            cf = item.get('cf')
+            cf = item.get('cashFlow') or item.get('ebitda')
             print(f"    price:    ${price:,.0f}" if price else "    price:    N/A")
             print(f"    cf:       ${cf:,.0f}" if cf else "    cf:       N/A")
-            print(f"    url:      {item.get('url','')}")
+            print(f"    url:      {item.get('urlStub','')}")
         if len(bbs_listings) > 3:
             print(f"\n  ... and {len(bbs_listings) - 3} more")
     else:
