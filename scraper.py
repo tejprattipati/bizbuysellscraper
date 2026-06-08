@@ -55,6 +55,10 @@ SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen_listings.json"))
 # Max pages to scrape per run
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10") or "10")
 
+# Optional ScraperAPI key — set this if Akamai JS challenge blocks direct access.
+# Get a free key at https://scraperapi.com (1000 free requests/month).
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -94,15 +98,18 @@ def save_seen(seen: set) -> None:
 # HTTP session with Chrome TLS fingerprint
 # ---------------------------------------------------------------------------
 
-def _make_session() -> Session:
+CHROME_PROFILE = os.getenv("CHROME_PROFILE", "chrome136")
+
+
+def _make_session(profile: str | None = None) -> Session:
     """curl_cffi session that impersonates Chrome's TLS/HTTP2 fingerprint."""
-    session = Session(impersonate="chrome124")
+    session = Session(impersonate=profile or CHROME_PROFILE)
     session.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
+        "Sec-CH-UA": '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
         "Sec-CH-UA-Mobile": "?0",
         "Sec-CH-UA-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
@@ -112,23 +119,47 @@ def _make_session() -> Session:
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/134.0.0.0 Safari/537.36"
+            "Chrome/136.0.0.0 Safari/537.36"
         ),
     })
     return session
 
 
 def fetch_html(session: Session, url: str) -> str | None:
-    """Fetch rendered HTML for url, returning None on hard failures."""
+    """Fetch rendered HTML for url.
+
+    If SCRAPER_API_KEY is set, routes through ScraperAPI which handles
+    Akamai JS challenges automatically. Otherwise uses direct curl_cffi.
+    """
+    if SCRAPER_API_KEY:
+        api_url = (
+            f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}"
+            f"&url={url}&render=true&country_code=us"
+        )
+        try:
+            import urllib.request
+            with urllib.request.urlopen(api_url, timeout=60) as r:
+                html = r.read().decode("utf-8", errors="replace")
+            verdict = _classify_response(html, 200)
+            print(f"  ScraperAPI verdict: {verdict} (len={len(html)})")
+            if verdict == "REAL_PAGE":
+                return html
+            print(f"  ScraperAPI did not return real page: {html[:300]}")
+            return None
+        except Exception as e:
+            print(f"  ScraperAPI error: {e}")
+            return None
+
     try:
         resp = session.get(url, timeout=30, allow_redirects=True)
         if resp.status_code == 200:
             html = resp.text
-            if "Access Denied" in html[:500]:
-                print(f"  ERROR: Got Access Denied page (status {resp.status_code})")
-                print(f"  HTML[:500]: {html[:500]}")
-                return None
-            return html
+            verdict = _classify_response(html, resp.status_code)
+            if verdict == "REAL_PAGE":
+                return html
+            print(f"  WARNING: {verdict} — not a real listings page")
+            print(f"  HTML[:300]: {html[:300]}")
+            return None
         print(f"  ERROR: HTTP {resp.status_code} for {url}")
         return None
     except Exception as e:
@@ -255,31 +286,59 @@ def scrape_all() -> list[dict]:
 # Diagnose mode — inspect raw rendered HTML and CSS structure
 # ---------------------------------------------------------------------------
 
+def _classify_response(html: str, status: int) -> str:
+    """Return one of: ACCESS_DENIED | AKAMAI_CHALLENGE | REAL_PAGE"""
+    if status != 200:
+        return f"HTTP_{status}"
+    if "Access Denied" in html[:600] and len(html) < 2000:
+        return "ACCESS_DENIED"
+    if "akamai" in html.lower()[:2000] and "behavioral" in html.lower()[:2000]:
+        return "AKAMAI_JS_CHALLENGE"
+    if "bizbuysell" in html.lower() and len(html) > 5000:
+        return "REAL_PAGE"
+    return f"UNKNOWN (len={len(html)})"
+
+
 def diagnose_page(url: str = BASE_URL) -> None:
     """
-    Fetch `url` with Chrome TLS impersonation and print a diagnostic report:
-    page title, article/section counts, all unique CSS classes, candidate
-    listing selectors, visible text sample, and raw HTML snippet.
+    Probe `url` across multiple Chrome TLS fingerprint profiles, classify
+    each response, then print a full structural report for the best result.
+
+    Response categories:
+      ACCESS_DENIED     — Akamai hard-blocked (wrong TLS fingerprint)
+      AKAMAI_JS_CHALLENGE — TLS passed but JS behavioral challenge served
+      REAL_PAGE         — Actual BizBuySell content returned
     """
-    session = _make_session()
+    # Profiles to probe in order from newest to oldest
+    profiles = ["chrome146", "chrome142", "chrome136", "chrome131", "chrome124"]
 
-    print(f"[diagnose] Warming up via homepage...")
-    try:
-        resp = session.get("https://www.bizbuysell.com/", timeout=30)
-        print(f"[diagnose] Homepage status: {resp.status_code}")
-        time.sleep(3)
-    except Exception as e:
-        print(f"[diagnose] Homepage load failed (continuing): {e}")
+    best_html = None
+    best_profile = None
+    best_status = None
 
-    print(f"[diagnose] Fetching target URL: {url}")
-    try:
-        resp = session.get(url, timeout=30, allow_redirects=True)
-        html = resp.text
-        status = resp.status_code
-    except Exception as e:
-        print(f"[diagnose] Failed: {e}")
-        return
+    for profile in profiles:
+        print(f"\n[probe] {profile} ...", end=" ", flush=True)
+        try:
+            session = _make_session(profile)
+            # Homepage warm-up
+            session.get("https://www.bizbuysell.com/", timeout=20)
+            time.sleep(1)
+            resp = session.get(url, timeout=30, allow_redirects=True)
+            html = resp.text
+            verdict = _classify_response(html, resp.status_code)
+            print(f"HTTP {resp.status_code} → {verdict}  (html len={len(html)})")
+            if verdict == "REAL_PAGE" and best_html is None:
+                best_html = html
+                best_profile = profile
+                best_status = resp.status_code
+            elif best_html is None:
+                best_html = html
+                best_profile = profile
+                best_status = resp.status_code
+        except Exception as e:
+            print(f"ERROR: {e}")
 
+    html = best_html or ""
     soup = BeautifulSoup(html, "html.parser")
 
     all_classes = sorted({
@@ -287,16 +346,17 @@ def diagnose_page(url: str = BASE_URL) -> None:
         for tag in soup.find_all(True)
         for c in (tag.get("class") or [])
     })
-
     keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
     candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
-
     article_count = len(soup.find_all("article"))
     section_count = len(soup.find_all("section"))
     body_text = soup.get_text(" ", strip=True)
+    verdict = _classify_response(html, best_status or 0)
 
     print("\n" + "=" * 70)
-    print(f"HTTP STATUS:      {status}")
+    print(f"BEST PROFILE:     {best_profile}")
+    print(f"HTTP STATUS:      {best_status}")
+    print(f"VERDICT:          {verdict}")
     print(f"PAGE TITLE:       {soup.title.string if soup.title else '(none)'}")
     print(f"<article> tags:   {article_count}")
     print(f"<section> tags:   {section_count}")
@@ -307,6 +367,18 @@ def diagnose_page(url: str = BASE_URL) -> None:
     print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:800]}")
     print(f"\nHTML SNIPPET (first 4000 chars):\n{html[:4000]}")
     print("=" * 70)
+
+    if verdict == "AKAMAI_JS_CHALLENGE":
+        print("\n⚠  AKAMAI JS CHALLENGE ACTIVE")
+        print("   curl_cffi cannot execute the behavioral JavaScript challenge.")
+        print("   Options to bypass this:")
+        print("   1. ScraperAPI (https://scraperapi.com) — has BizBuySell support built-in")
+        print("   2. Scrapfly (https://scrapfly.io) — handles Akamai specifically")
+        print("   3. Residential proxy + curl_cffi (challenge may not fire on residential IPs)")
+        print("   Set SCRAPER_API_KEY env var to use ScraperAPI automatically.")
+    elif verdict == "REAL_PAGE":
+        print(f"\n✓  Successfully retrieved real page content with profile '{best_profile}'")
+        print("   Update CHROME_PROFILE env var to lock in this profile.")
 
 
 # ---------------------------------------------------------------------------
