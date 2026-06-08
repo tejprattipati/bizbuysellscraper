@@ -1,0 +1,43 @@
+name: Diagnose Page Structure
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to diagnose (leave blank for default BBS agriculture URL)"
+        required: false
+        default: ""
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: claude/laughing-wozniak-XJdPJ
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install chromium --with-deps
+
+      - name: Diagnose page structure
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          if [ -n "$URL" ]; then
+            python scraper.py --diagnose "$URL"
+          else
+            python scraper.py --diagnose
+          fi
