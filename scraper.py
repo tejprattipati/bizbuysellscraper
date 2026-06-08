@@ -229,53 +229,76 @@ def extract_listings(html: str) -> list[dict]:
         return listings
 
     # Fallback: HTML card selectors.
-    # BizBuySell uses .diamond / .showcase / .basic for listing tiers.
-    # After Angular hydration, BBS-state script tag is removed — these cards remain.
+    # BizBuySell renders listing cards as <a class="diamond|showcase|basic"> elements.
+    # The <a> itself carries href (listing URL) and id (listing number).
     soup = BeautifulSoup(html, "html.parser")
-    cards = (
-        soup.select("div.diamond, div.showcase, div.basic")
-        or soup.select("div.listing-result")
-        or soup.select("article.result")
-        or soup.select(".listings article")
-        or soup.find_all("article")
-    )
+    cards = soup.select("a.diamond, a.showcase, a.basic")
+    if not cards:
+        # Older/alternate layout: div wrappers
+        cards = soup.select("div.diamond, div.showcase, div.basic")
     print(f"  BBS-state not found; HTML card count: {len(cards)}")
 
     listings = []
     for card in cards:
-        title_tag = (
-            card.find("a", class_=lambda c: c and "title" in " ".join(c).lower())
-            or card.find("h2") or card.find("h3") or card.find("a")
-        )
-        if not title_tag:
-            continue
-        href = title_tag.get("href", "")
+        # URL and listing ID are on the outer <a> card element itself
+        href = card.get("href", "")
         if href.startswith("/"):
             href = "https://www.bizbuysell.com" + href
+        listing_id = card.get("id", "") or href.split("?")[0].rstrip("/").split("/")[-1]
 
-        def get_stat(*keywords: str) -> str:
-            for kw in keywords:
-                for li in card.select("ul.stats li, li"):
-                    txt = li.get_text(" ", strip=True)
-                    if kw.lower() in txt.lower():
-                        spans = li.find_all("span")
-                        return spans[-1].get_text(strip=True) if len(spans) >= 2 else txt
-                el = card.find(attrs={"data-label": lambda v: v and kw.lower() in v.lower()})
-                if el:
-                    return el.get_text(strip=True)
-            return ""
+        title_tag = card.find("span", class_="title")
+        title = title_tag.get_text(strip=True) if title_tag else card.get("title", "")
 
-        price_text = get_stat("asking price", "listing price", "price")
-        cf_text = get_stat("cash flow", "ebitda", "sde")
+        loc_tag = card.find("p", class_="location")
+        location = loc_tag.get_text(strip=True) if loc_tag else ""
+
+        # Asking price: prefer the one inside .finance div (desktop display)
+        # Fall back to any .asking-price that isn't "Not Disclosed"
+        finance_div = card.find("div", class_="finance")
+        price_tag = None
+        if finance_div:
+            price_tag = finance_div.find("p", class_="asking-price")
+        if not price_tag:
+            price_tag = card.find("p", class_="asking-price")
+
+        price_text = ""
+        if price_tag:
+            classes = price_tag.get("class", [])
+            if "not-disclosed" in classes or "not-disclosed" in " ".join(classes):
+                price_text = "Not Disclosed"
+            else:
+                price_text = price_tag.get_text(strip=True)
+
+        # Cash flow: look in .finance first, then anywhere in card
+        cf_tag = None
+        if finance_div:
+            cf_tag = finance_div.find("p", class_="cash-flow")
+        if not cf_tag:
+            cf_tag = card.find("p", class_="cash-flow")
+        if not cf_tag:
+            cf_tag = card.find("p", class_="cash-flow-on-mobile")
+
+        cf_text = ""
+        if cf_tag:
+            cf_text = cf_tag.get_text(strip=True)
+            # Strip label prefixes like "Cash Flow: " or "EBITDA: "
+            for prefix in ("Cash Flow:", "EBITDA:", "SDE:"):
+                if cf_text.upper().startswith(prefix.upper()):
+                    cf_text = cf_text[len(prefix):].strip()
+                    break
+
+        if not href or not title:
+            continue
+
         listings.append({
-            "id": href.split("?")[0].rstrip("/"),
-            "title": title_tag.get_text(strip=True),
+            "id": listing_id,
+            "title": title,
             "url": href,
-            "location": get_stat("location", "city", "state"),
+            "location": location,
             "price": parse_dollar(price_text),
             "cf": parse_dollar(cf_text),
-            "price_text": price_text,
-            "cf_text": cf_text,
+            "price_text": price_text or "N/A",
+            "cf_text": cf_tag.get_text(strip=True) if cf_tag else "N/A",
         })
     return listings
 
