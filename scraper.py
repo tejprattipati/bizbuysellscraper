@@ -143,9 +143,9 @@ def _fetch_via_scrapfly(url: str) -> str | None:
         client = ScrapflyClient(key=SCRAPFLY_API_KEY)
         result = client.scrape(ScrapeConfig(
             url=url,
-            asp=True,          # Akamai bypass
+            asp=True,         # Akamai bypass
+            render_js=True,   # Required: Scrapfly needs JS rendering to pass Akamai behavioral challenge
             country="US",
-            render_js=False,   # SSR — data is in initial HTML, no JS needed
             retry=True,
         ))
         html = result.scrape_result["content"]
