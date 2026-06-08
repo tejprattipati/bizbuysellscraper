@@ -149,7 +149,8 @@ def _fetch_via_scrapfly(url: str) -> str | None:
             retry=True,
         ))
         html = result.scrape_result["content"]
-        verdict = _classify_response(html, result.scrape_result.get("status_code", 200))
+        status = result.scrape_result.get("status_code") or result.scrape_result.get("status") or 200
+        verdict = _classify_response(html, status)
         print(f"  Scrapfly verdict: {verdict} (len={len(html)})")
         if verdict == "REAL_PAGE":
             return html
@@ -370,42 +371,48 @@ def _classify_response(html: str, status: int) -> str:
 
 def diagnose_page(url: str = BASE_URL) -> None:
     """
-    Probe `url` across multiple Chrome TLS fingerprint profiles, classify
-    each response, then print a full structural report for the best result.
-
-    Response categories:
-      ACCESS_DENIED     — Akamai hard-blocked (wrong TLS fingerprint)
-      AKAMAI_JS_CHALLENGE — TLS passed but JS behavioral challenge served
-      REAL_PAGE         — Actual BizBuySell content returned
+    Probe `url`, preferring Scrapfly when key is set, then curl_cffi profiles.
+    Classifies the response and prints a full structural report.
     """
-    # Profiles to probe in order from newest to oldest
-    profiles = ["chrome146", "chrome142", "chrome136", "chrome131", "chrome124"]
-
     best_html = None
     best_profile = None
     best_status = None
 
-    for profile in profiles:
-        print(f"\n[probe] {profile} ...", end=" ", flush=True)
-        try:
-            session = _make_session(profile)
-            # Homepage warm-up
-            session.get("https://www.bizbuysell.com/", timeout=20)
-            time.sleep(1)
-            resp = session.get(url, timeout=30, allow_redirects=True)
-            html = resp.text
-            verdict = _classify_response(html, resp.status_code)
-            print(f"HTTP {resp.status_code} → {verdict}  (html len={len(html)})")
-            if verdict == "REAL_PAGE" and best_html is None:
-                best_html = html
-                best_profile = profile
-                best_status = resp.status_code
-            elif best_html is None:
-                best_html = html
-                best_profile = profile
-                best_status = resp.status_code
-        except Exception as e:
-            print(f"ERROR: {e}")
+    # --- Try Scrapfly first if key is configured ---
+    if SCRAPFLY_API_KEY:
+        print(f"\n[probe] scrapfly (asp=True) ...", end=" ", flush=True)
+        html = _fetch_via_scrapfly(url)
+        if html:
+            verdict = _classify_response(html, 200)
+            print(f"→ {verdict}  (html len={len(html)})")
+            best_html = html
+            best_profile = "scrapfly"
+            best_status = 200
+        else:
+            print("→ FAILED (see error above)")
+    else:
+        # --- Fallback: curl_cffi probe across Chrome profiles ---
+        profiles = ["chrome146", "chrome142", "chrome136", "chrome131", "chrome124"]
+        for profile in profiles:
+            print(f"\n[probe] {profile} ...", end=" ", flush=True)
+            try:
+                session = _make_session(profile)
+                session.get("https://www.bizbuysell.com/", timeout=20)
+                time.sleep(1)
+                resp = session.get(url, timeout=30, allow_redirects=True)
+                html = resp.text
+                verdict = _classify_response(html, resp.status_code)
+                print(f"HTTP {resp.status_code} → {verdict}  (html len={len(html)})")
+                if verdict == "REAL_PAGE" and best_html is None:
+                    best_html = html
+                    best_profile = profile
+                    best_status = resp.status_code
+                elif best_html is None:
+                    best_html = html
+                    best_profile = profile
+                    best_status = resp.status_code
+            except Exception as e:
+                print(f"ERROR: {e}")
 
     html = best_html or ""
     soup = BeautifulSoup(html, "html.parser")
