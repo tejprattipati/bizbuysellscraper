@@ -1,20 +1,21 @@
 """
 BizBuySell Agriculture Listings Scraper
-Fetches listings via Playwright (headless Chromium), applies filters,
-emails new ones since last run.
+Fetches listings via curl_cffi (Chrome TLS fingerprint impersonation),
+applies filters, emails new ones since last run.
 """
 
 import json
 import os
 import smtplib
 import time
+import random
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from curl_cffi.requests import Session
 
 
 def _now() -> datetime:
@@ -90,40 +91,54 @@ def save_seen(seen: set) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scraping with Playwright
+# HTTP session with Chrome TLS fingerprint
 # ---------------------------------------------------------------------------
 
-def fetch_html(page, url: str) -> str | None:
-    """Navigate to url and return rendered HTML after listings load."""
+def _make_session() -> Session:
+    """curl_cffi session that impersonates Chrome's TLS/HTTP2 fingerprint."""
+    session = Session(impersonate="chrome134")
+    session.headers.update({
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/134.0.0.0 Safari/537.36"
+        ),
+    })
+    return session
+
+
+def fetch_html(session: Session, url: str) -> str | None:
+    """Fetch rendered HTML for url, returning None on hard failures."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        # Wait for listing cards to appear — try several known selectors
-        for selector in [
-            "div.listing-result",
-            "article.result",
-            ".listings article",
-            "[class*='listing-result']",
-            "[class*='ListingResult']",
-        ]:
-            try:
-                page.wait_for_selector(selector, timeout=15_000)
-                print(f"  Listings appeared with selector: {selector}")
-                break
-            except PWTimeout:
-                continue
-        else:
-            # None matched — dump a snippet so we can debug selectors
-            body_text = page.inner_text("body")[:500]
-            html_snippet = page.content()[:2000]
-            print(f"  WARNING: no listing selector matched.")
-            print(f"  Body text[:500]: {body_text}")
-            print(f"  HTML[:2000]: {html_snippet}")
-        time.sleep(2)  # small extra wait for lazy-loaded content
-        return page.content()
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        if resp.status_code == 200:
+            html = resp.text
+            if "Access Denied" in html[:500]:
+                print(f"  ERROR: Got Access Denied page (status {resp.status_code})")
+                print(f"  HTML[:500]: {html[:500]}")
+                return None
+            return html
+        print(f"  ERROR: HTTP {resp.status_code} for {url}")
+        return None
     except Exception as e:
-        print(f"  Playwright error fetching {url}: {e}")
+        print(f"  Request error fetching {url}: {e}")
         return None
 
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
 def extract_listings(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
@@ -164,16 +179,13 @@ def extract_listings(html: str) -> list[dict]:
         # Stats — BizBuySell uses labeled <li> items in a <ul class="stats">
         def get_stat(*keywords: str) -> str:
             for kw in keywords:
-                # labeled list items
                 for li in card.select("ul.stats li, li"):
                     txt = li.get_text(" ", strip=True)
                     if kw.lower() in txt.lower():
-                        # value is usually the last span or the text after the label
                         spans = li.find_all("span")
                         if len(spans) >= 2:
                             return spans[-1].get_text(strip=True)
                         return txt
-                # data-label attributes
                 el = card.find(attrs={"data-label": lambda v: v and kw.lower() in v.lower()})
                 if el:
                     return el.get_text(strip=True)
@@ -204,164 +216,97 @@ def get_next_page_url(html: str) -> str | None:
     return None
 
 
-def _make_browser_context(pw):
-    """Shared browser + context setup used by both scrape_all and diagnose_page."""
-    browser = pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-infobars",
-            "--window-size=1280,800",
-        ],
-    )
-    ctx = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/134.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
-        locale="en-US",
-        java_script_enabled=True,
-        extra_http_headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-CH-UA": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
-            "Sec-CH-UA-Mobile": "?0",
-            "Sec-CH-UA-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        },
-    )
-    page = ctx.new_page()
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-        window.chrome = {runtime: {}};
-        const orig = navigator.permissions.query;
-        navigator.permissions.query = (params) =>
-            params.name === 'notifications'
-                ? Promise.resolve({state: Notification.permission})
-                : orig(params);
-    """)
-    return browser, ctx, page
-
-
-def diagnose_page(url: str = BASE_URL) -> dict:
-    """
-    Navigate to `url`, let JS render fully, then return a diagnostic dict with:
-      - page_title
-      - visible_text_sample  (first 800 chars of body text)
-      - all_classes          (every unique CSS class found in the DOM)
-      - candidate_selectors  (classes that look like listing containers)
-      - html_snippet         (first 4000 chars of rendered HTML)
-    Prints a formatted report and returns the dict so callers can inspect it.
-    """
-    with sync_playwright() as pw:
-        browser, ctx, page = _make_browser_context(pw)
-
-        print(f"[diagnose] Warming up via homepage...")
-        try:
-            page.goto("https://www.bizbuysell.com/", wait_until="domcontentloaded", timeout=60_000)
-            time.sleep(3)
-        except Exception as e:
-            print(f"[diagnose] Homepage load failed (continuing): {e}")
-
-        print(f"[diagnose] Loading target URL: {url}")
-        try:
-            page.goto(url, wait_until="networkidle", timeout=90_000)
-        except PWTimeout:
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(5)  # let lazy-loaded content settle
-
-        html = page.content()
-        body_text = page.inner_text("body")
-
-        # Collect every unique CSS class in the rendered DOM
-        all_classes: list[str] = page.evaluate("""() => {
-            const cls = new Set();
-            document.querySelectorAll('[class]').forEach(el => {
-                el.className.toString().split(/\\s+/).forEach(c => { if (c) cls.add(c); });
-            });
-            return [...cls].sort();
-        }""")
-
-        # Heuristic: classes that look like listing/result/card containers
-        keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
-        candidate_selectors = [c for c in all_classes if any(k in c.lower() for k in keywords)]
-
-        soup = BeautifulSoup(html, "html.parser")
-        article_count = len(soup.find_all("article"))
-        section_count = len(soup.find_all("section"))
-
-        report = {
-            "page_title": page.title(),
-            "visible_text_sample": body_text[:800],
-            "article_tags": article_count,
-            "section_tags": section_count,
-            "all_classes_count": len(all_classes),
-            "candidate_selectors": candidate_selectors,
-            "html_snippet": html[:4000],
-        }
-
-        print("\n" + "=" * 70)
-        print(f"PAGE TITLE:       {report['page_title']}")
-        print(f"<article> tags:   {article_count}")
-        print(f"<section> tags:   {section_count}")
-        print(f"Total CSS classes: {len(all_classes)}")
-        print(f"\nCANDIDATE LISTING SELECTORS ({len(candidate_selectors)}):")
-        for c in candidate_selectors:
-            print(f"  .{c}")
-        print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:800]}")
-        print(f"\nHTML SNIPPET (first 4000 chars):\n{html[:4000]}")
-        print("=" * 70)
-
-        browser.close()
-        return report
-
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
 
 def scrape_all() -> list[dict]:
-    import random
-
     all_listings = []
-    with sync_playwright() as pw:
-        browser, ctx, page = _make_browser_context(pw)
+    session = _make_session()
 
-        # Warm up: visit the homepage first to establish session cookies
-        print("Warming up session via homepage...")
-        try:
-            page.goto("https://www.bizbuysell.com/", wait_until="domcontentloaded", timeout=60_000)
-            time.sleep(random.uniform(2, 4))
-        except Exception as e:
-            print(f"  Homepage warm-up failed (continuing): {e}")
+    # Warm up: visit the homepage to establish session cookies
+    print("Warming up session via homepage...")
+    try:
+        resp = session.get("https://www.bizbuysell.com/", timeout=30)
+        print(f"  Homepage status: {resp.status_code}")
+        time.sleep(random.uniform(2, 4))
+    except Exception as e:
+        print(f"  Homepage warm-up failed (continuing): {e}")
 
-        # Block images/fonts only after warm-up to avoid triggering bot checks on first load
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+    url = BASE_URL
+    for page_num in range(1, MAX_PAGES + 1):
+        print(f"Scraping page {page_num}: {url}")
+        html = fetch_html(session, url)
+        if not html:
+            break
+        page_listings = extract_listings(html)
+        print(f"  Found {len(page_listings)} listings on page {page_num}")
+        all_listings.extend(page_listings)
+        next_url = get_next_page_url(html)
+        if not next_url:
+            break
+        url = next_url
+        time.sleep(random.uniform(2, 4))
 
-        url = BASE_URL
-        for page_num in range(1, MAX_PAGES + 1):
-            print(f"Scraping page {page_num}: {url}")
-            html = fetch_html(page, url)
-            if not html:
-                break
-            page_listings = extract_listings(html)
-            print(f"  Found {len(page_listings)} listings on page {page_num}")
-            all_listings.extend(page_listings)
-            next_url = get_next_page_url(html)
-            if not next_url:
-                break
-            url = next_url
-            time.sleep(random.uniform(2, 4))
-
-        browser.close()
     return all_listings
+
+
+# ---------------------------------------------------------------------------
+# Diagnose mode — inspect raw rendered HTML and CSS structure
+# ---------------------------------------------------------------------------
+
+def diagnose_page(url: str = BASE_URL) -> None:
+    """
+    Fetch `url` with Chrome TLS impersonation and print a diagnostic report:
+    page title, article/section counts, all unique CSS classes, candidate
+    listing selectors, visible text sample, and raw HTML snippet.
+    """
+    session = _make_session()
+
+    print(f"[diagnose] Warming up via homepage...")
+    try:
+        resp = session.get("https://www.bizbuysell.com/", timeout=30)
+        print(f"[diagnose] Homepage status: {resp.status_code}")
+        time.sleep(3)
+    except Exception as e:
+        print(f"[diagnose] Homepage load failed (continuing): {e}")
+
+    print(f"[diagnose] Fetching target URL: {url}")
+    try:
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        html = resp.text
+        status = resp.status_code
+    except Exception as e:
+        print(f"[diagnose] Failed: {e}")
+        return
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    all_classes = sorted({
+        c
+        for tag in soup.find_all(True)
+        for c in (tag.get("class") or [])
+    })
+
+    keywords = ("listing", "result", "card", "business", "sale", "item", "tile", "row")
+    candidates = [c for c in all_classes if any(k in c.lower() for k in keywords)]
+
+    article_count = len(soup.find_all("article"))
+    section_count = len(soup.find_all("section"))
+    body_text = soup.get_text(" ", strip=True)
+
+    print("\n" + "=" * 70)
+    print(f"HTTP STATUS:      {status}")
+    print(f"PAGE TITLE:       {soup.title.string if soup.title else '(none)'}")
+    print(f"<article> tags:   {article_count}")
+    print(f"<section> tags:   {section_count}")
+    print(f"Total CSS classes: {len(all_classes)}")
+    print(f"\nCANDIDATE LISTING SELECTORS ({len(candidates)}):")
+    for c in candidates:
+        print(f"  .{c}")
+    print(f"\nVISIBLE TEXT SAMPLE:\n{body_text[:800]}")
+    print(f"\nHTML SNIPPET (first 4000 chars):\n{html[:4000]}")
+    print("=" * 70)
 
 
 # ---------------------------------------------------------------------------
