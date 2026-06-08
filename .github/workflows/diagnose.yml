@@ -31,6 +31,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Diagnose page structure
+        env:
+          SCRAPFLY_API_KEY: ${{ secrets.SCRAPFLY_API_KEY }}
         run: |
           URL="${{ github.event.inputs.url }}"
           if [ -n "$URL" ]; then

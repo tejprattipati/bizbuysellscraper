@@ -55,9 +55,12 @@ SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen_listings.json"))
 # Max pages to scrape per run
 MAX_PAGES = int(os.getenv("MAX_PAGES", "10") or "10")
 
-# Optional ScraperAPI key — set this if Akamai JS challenge blocks direct access.
-# Get a free key at https://scraperapi.com (1000 free requests/month).
+# Optional ScraperAPI key (fallback, low Akamai success rate — prefer Scrapfly).
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+
+# Scrapfly API key — handles Akamai with asp=True (97% success rate).
+# Get a free key at https://scrapfly.io (1000 free credits/month, no credit card).
+SCRAPFLY_API_KEY = os.getenv("SCRAPFLY_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -126,30 +129,58 @@ def _make_session(profile: str | None = None) -> Session:
 
 
 def fetch_html(session: Session, url: str) -> str | None:
-    """Fetch rendered HTML for url.
-
-    If SCRAPER_API_KEY is set, routes through ScraperAPI which handles
-    Akamai JS challenges automatically. Otherwise uses direct curl_cffi.
-    """
+    """Fetch HTML for url, using Scrapfly (asp=True) when key is set."""
+    if SCRAPFLY_API_KEY:
+        return _fetch_via_scrapfly(url)
     if SCRAPER_API_KEY:
-        api_url = (
-            f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}"
-            f"&url={url}&render=true&country_code=us"
-        )
-        try:
-            import urllib.request
-            with urllib.request.urlopen(api_url, timeout=60) as r:
-                html = r.read().decode("utf-8", errors="replace")
-            verdict = _classify_response(html, 200)
-            print(f"  ScraperAPI verdict: {verdict} (len={len(html)})")
-            if verdict == "REAL_PAGE":
-                return html
-            print(f"  ScraperAPI did not return real page: {html[:300]}")
-            return None
-        except Exception as e:
-            print(f"  ScraperAPI error: {e}")
-            return None
+        return _fetch_via_scraperapi(url)
+    return _fetch_direct(session, url)
 
+
+def _fetch_via_scrapfly(url: str) -> str | None:
+    try:
+        from scrapfly import ScrapflyClient, ScrapeConfig
+        client = ScrapflyClient(key=SCRAPFLY_API_KEY)
+        result = client.scrape(ScrapeConfig(
+            url=url,
+            asp=True,          # Akamai bypass
+            country="US",
+            render_js=False,   # SSR — data is in initial HTML, no JS needed
+            retry=True,
+        ))
+        html = result.scrape_result["content"]
+        verdict = _classify_response(html, result.scrape_result.get("status_code", 200))
+        print(f"  Scrapfly verdict: {verdict} (len={len(html)})")
+        if verdict == "REAL_PAGE":
+            return html
+        print(f"  Scrapfly did not return real page: {html[:300]}")
+        return None
+    except Exception as e:
+        print(f"  Scrapfly error: {e}")
+        return None
+
+
+def _fetch_via_scraperapi(url: str) -> str | None:
+    api_url = (
+        f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}"
+        f"&url={url}&render=true&country_code=us"
+    )
+    try:
+        import urllib.request
+        with urllib.request.urlopen(api_url, timeout=60) as r:
+            html = r.read().decode("utf-8", errors="replace")
+        verdict = _classify_response(html, 200)
+        print(f"  ScraperAPI verdict: {verdict} (len={len(html)})")
+        if verdict == "REAL_PAGE":
+            return html
+        print(f"  ScraperAPI did not return real page: {html[:300]}")
+        return None
+    except Exception as e:
+        print(f"  ScraperAPI error: {e}")
+        return None
+
+
+def _fetch_direct(session: Session, url: str) -> str | None:
     try:
         resp = session.get(url, timeout=30, allow_redirects=True)
         if resp.status_code == 200:
